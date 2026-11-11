@@ -1,5 +1,7 @@
 #include "vpx_decoder.h"
 
+#include <limits.h>
+
 // The following code is based on the simple_decoder example provided by libvpx
 // (https://github.com/webmproject/libvpx/blob/main/examples/simple_decoder.c)
 
@@ -38,7 +40,9 @@ size_t get_image_byte_size(const vpx_image_t *img) {
 
   for (int plane = 0; plane < number_of_planes; ++plane) {
     Dimensions plane_dimensions = get_plane_dimensions(img, plane);
-    image_size += plane_dimensions.width * plane_dimensions.height * bytes_per_pixel;
+    // Widen before multiplying: VP9 allows 65536x65536 images, whose byte
+    // size overflows unsigned int.
+    image_size += (size_t)plane_dimensions.width * plane_dimensions.height * bytes_per_pixel;
   }
   return image_size;
 }
@@ -47,9 +51,20 @@ void get_raw_frame_from_image(vpx_image_t *img, UnifexPayload *raw_frame) {
   convert_between_image_and_raw_frame(img, raw_frame, IMAGE_TO_RAW_FRAME);
 }
 
-void alloc_output_frame(UnifexEnv *env, const vpx_image_t *img, decoded_frame *output_frame) {
+// Returns 0 on success and -1 when the image does not fit in a payload (whose
+// size is an unsigned int) or the payload cannot be allocated.
+int alloc_output_frame(UnifexEnv *env, const vpx_image_t *img, decoded_frame *output_frame) {
+  size_t image_size = get_image_byte_size(img);
+  output_frame->payload = NULL;
+  if (image_size > UINT_MAX) return -1;
+
   output_frame->payload = unifex_alloc(sizeof(UnifexPayload));
-  unifex_payload_alloc(env, UNIFEX_PAYLOAD_BINARY, get_image_byte_size(img), output_frame->payload);
+  if (!unifex_payload_alloc(env, UNIFEX_PAYLOAD_BINARY, image_size, output_frame->payload)) {
+    unifex_free(output_frame->payload);
+    output_frame->payload = NULL;
+    return -1;
+  }
+  return 0;
 }
 
 void free_frames(decoded_frame *output_frames, unsigned int payloads_cnt) {
@@ -97,7 +112,12 @@ UNIFEX_TERM decode_frame(UnifexEnv *env, UnifexPayload *frame, State *state) {
       output_frames = unifex_realloc(output_frames, allocated_frames * sizeof(decoded_frame));
     }
 
-    alloc_output_frame(env, img, &output_frames[frames_cnt]);
+    if (alloc_output_frame(env, img, &output_frames[frames_cnt]) < 0) {
+      free_frames(output_frames, frames_cnt);
+      return result_error(
+          env, "Decoded frame too large to allocate", decode_frame_result_error, NULL, NULL
+      );
+    }
 
     get_raw_frame_from_image(img, output_frames[frames_cnt].payload);
     output_frames[frames_cnt].pixel_format = get_pixel_format_from_image(img);
